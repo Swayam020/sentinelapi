@@ -1,38 +1,81 @@
 """
-Core anomaly detection logic using scikit-learn's Isolation Forest.
+Anomaly scoring against pre-trained Isolation Forest models.
+
+Models are trained offline (app/ml/train.py) on a 100K-row corpus and loaded
+once at startup. Inference NEVER refits — incoming values are scored against
+the frozen forest, which makes per-point scoring deterministic and independent
+of window composition (the property the per-point cache relies on).
 """
+from __future__ import annotations
+
+import os
+from functools import lru_cache
+from typing import Dict, List
+
 import numpy as np
-from sklearn.ensemble import IsolationForest
-from typing import List, Tuple
+import joblib
 
-from app.models.schemas import AnomalyDetail, SeverityLevel
+from app.models.schemas import SeverityLevel
+
+MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "ml", "models")
+METRIC_TYPES = ("cpu", "memory", "latency")
 
 
-def _classify_severity(score: float, is_anomaly: bool) -> SeverityLevel:
+class ModelNotTrained(RuntimeError):
+    pass
+
+
+@lru_cache(maxsize=1)
+def _load() -> Dict[str, object]:
+    reg_path = os.path.join(MODELS_DIR, "registry.joblib")
+    if not os.path.exists(reg_path):
+        raise ModelNotTrained(
+            "Models not found. Run: python -m app.ml.generate_dataset "
+            "&& python -m app.ml.train"
+        )
+    registry = joblib.load(reg_path)
+    models = {m: joblib.load(os.path.join(MODELS_DIR, f"{m}.joblib")) for m in METRIC_TYPES}
+    return {"registry": registry, "models": models}
+
+
+def registry() -> dict:
+    return _load()["registry"]
+
+
+def threshold_for(metric_type: str, sensitivity: float = 1.0) -> float:
     """
-    Map an Isolation Forest decision score to a human-readable severity.
-
-    Isolation Forest scores are centred around 0:
-      - Positive scores  → normal (closer to +0.5 = very normal)
-      - Negative scores  → anomalous (closer to -0.5 = very anomalous)
+    For decision_function, a point is anomalous when its score < 0 (the offset is
+    already folded in). `sensitivity` shifts that cutoff without retraining:
+    >1 raises it (flags more), <1 lowers it (flags fewer). Default 1.0 -> cutoff 0,
+    matching the model's own predict().
     """
+    _ = _load()["registry"]["metrics"][metric_type]
+    return (sensitivity - 1.0) * 0.05
+
+
+def score_values(metric_type: str, values: List[float]) -> np.ndarray:
+    """Raw Isolation Forest decision scores; one batched call, per-point independent."""
+    if metric_type not in METRIC_TYPES:
+        raise ValueError(f"Unknown metric_type '{metric_type}'. Use one of {METRIC_TYPES}.")
+    model = _load()["models"][metric_type]
+    X = np.asarray(values, dtype=float).reshape(-1, 1)
+    return model.decision_function(X)
+
+
+def classify_severity(score: float, is_anomaly: bool) -> SeverityLevel:
     if not is_anomaly:
         return SeverityLevel.NORMAL
-
-    # score is negative for anomalies; we work with the absolute magnitude
     magnitude = abs(score)
-
-    if magnitude >= 0.35:
+    if magnitude >= 0.08:
         return SeverityLevel.CRITICAL
-    elif magnitude >= 0.25:
+    elif magnitude >= 0.05:
         return SeverityLevel.HIGH
-    elif magnitude >= 0.15:
+    elif magnitude >= 0.025:
         return SeverityLevel.MEDIUM
-    else:
-        return SeverityLevel.LOW
+    return SeverityLevel.LOW
 
 
-def _worst_severity(severities: List[SeverityLevel]) -> SeverityLevel:
+def worst_severity(severities: List[SeverityLevel]) -> SeverityLevel:
     order = [
         SeverityLevel.NORMAL,
         SeverityLevel.LOW,
@@ -45,43 +88,3 @@ def _worst_severity(severities: List[SeverityLevel]) -> SeverityLevel:
         if order.index(s) > order.index(best):
             best = s
     return best
-
-
-def detect_anomalies(
-    values: List[float], contamination: float = 0.05
-) -> Tuple[List[AnomalyDetail], SeverityLevel]:
-    """
-    Run Isolation Forest on a list of numeric values.
-
-    Returns a list of AnomalyDetail objects and the overall (worst) severity.
-    """
-    X = np.array(values).reshape(-1, 1)
-
-    model = IsolationForest(
-        contamination=contamination,
-        n_estimators=100,
-        random_state=42,
-        n_jobs=-1,
-    )
-    model.fit(X)
-
-    # decision_function: positive = normal, negative = anomaly
-    scores: np.ndarray = model.decision_function(X)
-    predictions: np.ndarray = model.predict(X)  # 1 = normal, -1 = anomaly
-
-    details: List[AnomalyDetail] = []
-    for i, (val, score, pred) in enumerate(zip(values, scores, predictions)):
-        is_anomaly = pred == -1
-        severity = _classify_severity(float(score), is_anomaly)
-        details.append(
-            AnomalyDetail(
-                index=i,
-                value=float(val),
-                anomaly_score=round(float(score), 6),
-                severity=severity,
-                is_anomaly=is_anomaly,
-            )
-        )
-
-    overall = _worst_severity([d.severity for d in details])
-    return details, overall
