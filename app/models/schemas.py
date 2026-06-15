@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional
 from enum import Enum
+from typing import List
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class SeverityLevel(str, Enum):
@@ -11,71 +12,62 @@ class SeverityLevel(str, Enum):
     CRITICAL = "critical"
 
 
-class DataPoint(BaseModel):
-    timestamp: Optional[float] = Field(
-        default=None,
-        description="Unix timestamp (optional). Auto-assigned if omitted.",
-    )
-    value: float = Field(..., description="Numeric metric value.")
+class MetricType(str, Enum):
+    CPU = "cpu"
+    MEMORY = "memory"
+    LATENCY = "latency"
 
 
 class TimeSeriesInput(BaseModel):
-    stream_id: str = Field(
-        ...,
-        description="Unique identifier for this data stream (e.g. 'cpu_host_01').",
-        examples=["api_response_time_prod"],
+    stream_id: str = Field(..., examples=["api_response_time_prod"],
+                           description="Unique identifier for this data stream.")
+    metric_type: MetricType = Field(
+        ..., description="Which pre-trained model to score against (cpu | memory | latency)."
     )
     data: List[float] = Field(
-        ...,
-        min_length=10,
-        description="Ordered list of numeric values (min 10 points).",
-        examples=[[120.5, 118.2, 119.8, 500.1, 121.0, 119.5, 118.9, 120.2, 600.3, 119.7]],
+        ..., min_length=1,
+        description="Ordered list of metric values for this window.",
+        examples=[[34.1, 35.0, 33.8, 98.7, 34.2, 35.5, 99.1, 34.0]],
     )
-    contamination: float = Field(
-        default=0.05,
-        ge=0.01,
-        le=0.5,
-        description="Expected proportion of anomalies (0.01–0.50). Default: 0.05.",
+    sensitivity: float = Field(
+        default=1.0, ge=0.25, le=4.0,
+        description="Tunes the anomaly cutoff without retraining (>1 = more sensitive).",
     )
 
     @field_validator("stream_id")
     @classmethod
-    def validate_stream_id(cls, v: str) -> str:
+    def _strip_id(cls, v: str) -> str:
         v = v.strip()
         if not v:
             raise ValueError("stream_id must not be empty.")
         if len(v) > 128:
-            raise ValueError("stream_id must be ≤ 128 characters.")
+            raise ValueError("stream_id must be <= 128 characters.")
         return v
 
 
 class AnomalyDetail(BaseModel):
-    index: int = Field(..., description="Position in the input array.")
-    value: float = Field(..., description="Original metric value.")
-    anomaly_score: float = Field(
-        ..., description="Isolation Forest score. More negative = more anomalous."
-    )
-    severity: SeverityLevel = Field(..., description="Classified severity level.")
-    is_anomaly: bool = Field(..., description="True if classified as an anomaly.")
+    index: int
+    value: float
+    anomaly_score: float = Field(..., description="Isolation Forest score; more negative = more anomalous.")
+    severity: SeverityLevel
+    is_anomaly: bool
+    from_cache: bool = Field(..., description="True if this point's score was served from cache.")
 
 
 class DetectionResponse(BaseModel):
     stream_id: str
+    metric_type: MetricType
     total_points: int
     anomaly_count: int
-    anomaly_rate: float = Field(..., description="Fraction of anomalous points.")
-    overall_severity: SeverityLevel = Field(
-        ..., description="Worst severity seen in this window."
-    )
+    anomaly_rate: float
+    overall_severity: SeverityLevel
     details: List[AnomalyDetail]
-    cached: bool = Field(default=False, description="True if result was served from cache.")
-    model_contamination: float
+    cache_hits: int = Field(..., description="Points in this request served from cache.")
+    model_inferences: int = Field(..., description="Points in this request scored by the model.")
 
 
 class BatchInput(BaseModel):
-    streams: List[TimeSeriesInput] = Field(
-        ..., min_length=1, max_length=20, description="Up to 20 streams per batch."
-    )
+    streams: List[TimeSeriesInput] = Field(..., min_length=1, max_length=20)
 
 
 class BatchResponse(BaseModel):
