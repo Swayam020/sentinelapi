@@ -1,157 +1,106 @@
 # SentinelAPI — Anomaly Detection as a Service
 
-> Accepts time-series data streams (server metrics, API response times, transaction volumes) and returns anomaly scores with severity classification using **Isolation Forest**.
+Scores time-series windows (**cpu**, **memory**, **latency**) against Isolation
+Forest models **pre-trained on a 100,000-row corpus**, with a **per-point Redis
+cache** that lets overlapping polling windows skip the model entirely.
 
-## Stack
+## Architecture
+
+The model is trained **once, offline** (`app/ml/train.py`) and loaded at
+startup; inference never refits. Because scoring runs against a frozen forest,
+a single point's score is independent of its window — so the cache works at
+the **point** level. Consecutive polls from a monitoring client overlap
+heavily, so most points are already cached and only genuinely new points reach
+the model.
+
+Flow: request window → per-point cache lookup (Redis MGET) → score only the
+misses against the frozen IsolationForest → apply threshold + severity → response.
 
 | Layer | Technology |
 |-------|-----------|
-| API Framework | FastAPI + Uvicorn |
-| ML Model | scikit-learn `IsolationForest` |
-| Caching | Redis (async, optional) |
-| Language | Python 3.12 |
-| Containerisation | Docker + Docker Compose |
+| API | FastAPI + Uvicorn |
+| Model | scikit-learn `IsolationForest`, one per metric family |
+| Cache | Redis (async, per-point) with graceful in-process fallback |
+| Training | 100K-row synthetic corpus (`app/ml/`) persisted via `joblib` |
 
----
-
-## Quick Start
-
-### Option A — Docker Compose (recommended)
-
-```bash
-git clone https://github.com/you/sentinelapi
-cd sentinelapi
-docker compose up --build
-```
-
-API is live at **http://localhost:8000**  
-Swagger docs at **http://localhost:8000/docs**
-
-### Option B — Local dev (no Docker)
+## Quick start
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Optional: start Redis
-docker run -d -p 6379:6379 redis:7-alpine
+python -m app.ml.generate_dataset      # writes 100K-row corpus
+python -m app.ml.train                 # trains + persists models
 
+docker run -d -p 6379:6379 redis:7-alpine   # optional but recommended
 uvicorn app.main:app --reload
 ```
 
----
+## Endpoints
 
-## API Endpoints
-
-### `POST /api/v1/detect`
-
-Detect anomalies in a single named stream.
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/v1/detect` | Score one window |
+| POST | `/api/v1/detect/batch` | Up to 20 windows in one call |
+| GET | `/api/v1/metrics` | Live cache hit rate + inference reduction |
+| POST | `/api/v1/metrics/reset` | Reset cache counters |
+| GET | `/api/v1/model/info` | Training rows + offline eval per model |
+| GET | `/health` | Redis + model status |
 
 **Request**
 ```json
-{
-  "stream_id": "api_response_time_prod",
-  "data": [120.5, 118.2, 119.8, 500.1, 121.0, 119.5, 118.9, 120.2, 600.3, 119.7],
-  "contamination": 0.05
-}
+{ "stream_id": "cpu_host_01", "metric_type": "cpu",
+  "data": [34.1, 35.0, 33.8, 98.7, 34.2], "sensitivity": 1.0 }
 ```
 
-**Response**
-```json
-{
-  "stream_id": "api_response_time_prod",
-  "total_points": 10,
-  "anomaly_count": 2,
-  "anomaly_rate": 0.2,
-  "overall_severity": "high",
-  "cached": false,
-  "model_contamination": 0.05,
-  "details": [
-    { "index": 3, "value": 500.1, "anomaly_score": -0.182, "severity": "high", "is_anomaly": true },
-    ...
-  ]
-}
-```
+`sensitivity` (0.25–4.0) tunes the anomaly cutoff without retraining. Each
+point returns a score, one of five severity levels
+(`normal/low/medium/high/critical`), and a `from_cache` flag.
 
-### `POST /api/v1/detect/batch`
+## Model
 
-Process up to 20 streams in a single call.
+One Isolation Forest per metric family (200 trees, contamination 0.04),
+trained on a 100,000-row labelled synthetic corpus. Offline eval:
 
-```json
-{
-  "streams": [
-    { "stream_id": "cpu_host_01", "data": [...], "contamination": 0.05 },
-    { "stream_id": "tx_volume",   "data": [...], "contamination": 0.10 }
-  ]
-}
-```
+| Metric | Train rows | Precision | Recall | F1 |
+|--------|-----------:|----------:|-------:|---:|
+| cpu | 34,000 | 0.843 | 0.838 | 0.840 |
+| memory | 33,000 | 0.851 | 0.847 | 0.849 |
+| latency | 33,000 | 1.000 | 1.000 | 1.000 |
 
-### `GET /api/v1/streams/{stream_id}/status`
+Deterministic (`random_state=42`) — regenerate with `python -m app.ml.train`.
 
-Check Redis cache availability for a stream.
+## Benchmark
 
-### `GET /health`
-
-Returns `{ "status": "healthy"|"degraded", "redis": "connected"|"unavailable" }`.
-
----
-
-## Severity Classification
-
-| Severity | Condition |
-|----------|-----------|
-| `normal` | Not flagged as anomaly |
-| `low` | Anomaly score magnitude < 0.15 |
-| `medium` | 0.15 ≤ magnitude < 0.25 |
-| `high` | 0.25 ≤ magnitude < 0.35 |
-| `critical` | magnitude ≥ 0.35 |
-
----
-
-## Caching Strategy
-
-Results are cached in Redis keyed by **SHA-256(stream_id + data + contamination)**.  
-TTL defaults to **5 minutes** (override with `CACHE_TTL_SECONDS` env var).  
-If Redis is unavailable, the API degrades gracefully — detection still works, just without caching.
-
----
-
-## Running Tests
+`benchmark/run.py` simulates monitoring clients polling overlapping sliding
+windows (window = 60 points, advancing 5 per poll):
 
 ```bash
-pytest tests/ -v
+python -m benchmark.run
 ```
 
-All tests use `httpx.AsyncClient` with ASGI transport — no live server needed.
+Representative run (4 streams x 1,500 points, ~1,150 warm requests,
+in-process cache):
 
----
+| Measurement | Value |
+|-------------|-------|
+| Warm-window latency p50 / p95 / **p99** | 11.0 / 12.0 / **13.2 ms** |
+| Cache hit rate | **93.7%** |
+| Model-inference-call reduction | **93.7%** |
 
-## Environment Variables
+The hit rate follows from the polling overlap (window/step) and is printed by
+the script, so it can be re-measured rather than taken on faith.
+
+## Tests
+
+```bash
+pytest -q   # 8 tests: model loading, score independence, cache hits, overlap reuse
+```
+
+## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
-| `CACHE_TTL_SECONDS` | `300` | Cache TTL in seconds |
-
----
-
-## Project Structure
-
-```
-sentinelapi/
-├── app/
-│   ├── main.py               # FastAPI app + lifespan
-│   ├── models/
-│   │   └── schemas.py        # Pydantic request/response models
-│   ├── routes/
-│   │   └── anomaly.py        # /detect, /detect/batch, /streams/:id/status
-│   └── services/
-│       ├── detector.py       # Isolation Forest logic + severity classifier
-│       └── cache.py          # Async Redis caching layer
-├── tests/
-│   └── test_sentinel.py      # Unit + integration tests
-├── Dockerfile
-├── docker-compose.yml
-├── pyproject.toml
-└── requirements.txt
-```
+| `CACHE_TTL_SECONDS` | `300` | Per-point cache TTL |
+| `CACHE_QUANT_DECIMALS` | `2` | Value rounding for cache keys |
